@@ -21,6 +21,10 @@ MAX_IMAGE_CELLS = 16_000_000
 MAX_BATCH_SLICES = 8
 DEFAULT_MIN_AREA = 20
 MAX_DETECTED_ELEMENTS = 500
+DEFAULT_MODEL_TOLERANCE = 0.35
+DEFAULT_PIPE_MAX_WIDTH = 0.12
+DEFAULT_PIPE_MIN_RATIO = 3.0
+CIRCLE_SEGMENTS = 48
 
 
 def log(message: str) -> None:
@@ -62,6 +66,10 @@ def output_path(input_path: Path, name: Path | None, height: float, total: int) 
 
 def metadata_path(input_path: Path) -> Path:
     return OUTPUT_DIR / f"{input_path.stem}_fatias.json"
+
+
+def obj_path(input_path: Path) -> Path:
+    return OUTPUT_DIR / f"{input_path.stem}_modelo.obj"
 
 
 def resolve_input(path: Path) -> Path:
@@ -432,6 +440,8 @@ def detect_geometric_elements(
         x, y, width, height = bbox
         world_x0, world_y0 = point_to_world(x, y, bins_x, bins_y, min_x, max_x, min_y, max_y)
         world_x1, world_y1 = point_to_world(x + width, y + height, bins_x, bins_y, min_x, max_x, min_y, max_y)
+        contour_px = [[float(point[0][0]), float(point[0][1])] for point in approx]
+        contour = [list(point_to_world(px, py, bins_x, bins_y, min_x, max_x, min_y, max_y)) for px, py in contour_px]
         elements.append(
             {
                 "tipo": classify_shape(len(approx), area, perimeter, bbox),
@@ -442,11 +452,184 @@ def detect_geometric_elements(
                 "centro": [world_cx, world_cy],
                 "bbox_px": [x, y, width, height],
                 "bbox": [world_x0, world_y0, world_x1, world_y1],
+                "contorno_px": contour_px,
+                "contorno": contour,
             }
         )
         if len(elements) >= MAX_DETECTED_ELEMENTS:
             break
     return elements
+
+
+def distance(a: list[float], b: list[float]) -> float:
+    return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+
+def bbox_size(bbox: list[float]) -> tuple[float, float]:
+    return abs(bbox[2] - bbox[0]), abs(bbox[3] - bbox[1])
+
+
+def rectangle_contour(bbox: list[float]) -> list[list[float]]:
+    x0, y0, x1, y1 = bbox
+    return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+
+
+def circle_contour(center: list[float], radius: float) -> list[list[float]]:
+    return [
+        [
+            float(center[0] + np.cos(angle) * radius),
+            float(center[1] + np.sin(angle) * radius),
+        ]
+        for angle in np.linspace(0, 2 * np.pi, CIRCLE_SEGMENTS, endpoint=False)
+    ]
+
+
+def average_points(values: list[list[float]]) -> list[float]:
+    return [float(value) for value in np.asarray(values, dtype=float).mean(axis=0)]
+
+
+def build_model_groups(records: list[dict], tolerance: float) -> list[dict]:
+    groups = []
+    for record_index, record in enumerate(records):
+        for element_index, element in enumerate(record.get("elementos", [])):
+            center = element["centro"]
+            width, height = bbox_size(element["bbox"])
+            best = None
+            best_score = None
+            for group in groups:
+                if record_index - group["ultimo_indice"] > 2:
+                    continue
+                if element["tipo"] != group["tipo"]:
+                    continue
+                group_width, group_height = bbox_size(group["bbox_media"])
+                center_delta = distance(center, group["centro_medio"])
+                size_delta = max(abs(width - group_width), abs(height - group_height))
+                if center_delta > tolerance or size_delta > tolerance:
+                    continue
+                score = center_delta + size_delta
+                if best_score is None or score < best_score:
+                    best = group
+                    best_score = score
+            if best is None:
+                best = {
+                    "id": len(groups) + 1,
+                    "tipo": element["tipo"],
+                    "elementos": [],
+                    "centros": [],
+                    "bboxes": [],
+                    "z_inicial": record["z_inicial"],
+                    "z_final": record["z_final"],
+                    "ultimo_indice": record_index,
+                    "centro_medio": center,
+                    "bbox_media": element["bbox"],
+                }
+                groups.append(best)
+            best["elementos"].append([record_index, element_index])
+            best["centros"].append(center)
+            best["bboxes"].append(element["bbox"])
+            best["z_inicial"] = min(best["z_inicial"], record["z_inicial"])
+            best["z_final"] = max(best["z_final"], record["z_final"])
+            best["ultimo_indice"] = record_index
+            best["centro_medio"] = average_points(best["centros"])
+            best["bbox_media"] = average_points(best["bboxes"])
+
+    modeled = []
+    for group in groups:
+        width, height = bbox_size(group["bbox_media"])
+        if group["tipo"] == "circulo":
+            contour = circle_contour(group["centro_medio"], (width + height) / 4)
+            model_type = "cilindro"
+        elif group["tipo"] in {"quadrado", "retangulo"}:
+            contour = rectangle_contour(group["bbox_media"])
+            model_type = group["tipo"]
+        else:
+            contour = rectangle_contour(group["bbox_media"])
+            model_type = group["tipo"]
+        modeled_group = {
+            "id": group["id"],
+            "tipo": model_type,
+            "z_inicial": float(group["z_inicial"]),
+            "z_final": float(group["z_final"]),
+            "centro": group["centro_medio"],
+            "bbox": group["bbox_media"],
+            "contorno": contour,
+            "fatias": len(group["elementos"]),
+        }
+        modeled.append(modeled_group)
+        for record_index, element_index in group["elementos"]:
+            records[record_index]["elementos"][element_index]["grupo_modelo"] = group["id"]
+            records[record_index]["elementos"][element_index]["contorno_modelado"] = contour
+    return modeled
+
+
+def apply_pipe_detection(groups: list[dict], max_width: float, min_ratio: float) -> None:
+    for group in groups:
+        width, height = bbox_size(group["bbox"])
+        thin = min(width, height)
+        long = max(width, height)
+        if thin <= max_width and long / max(thin, np.finfo(float).eps) >= min_ratio:
+            group["tipo"] = "tubulacao"
+            group["eixo"] = "x" if width >= height else "y"
+            group["raio"] = float(max(thin / 2, 0.01))
+
+
+def append_pipe_cylinder(lines: list[str], group: dict, vertex_index: int) -> int:
+    x0, y0, x1, y1 = group["bbox"]
+    cx, cy = group["centro"]
+    z = (group["z_inicial"] + group["z_final"]) / 2
+    radius = group["raio"]
+    axis = group["eixo"]
+    lines.append(f"o grupo_{group['id']}_{group['tipo']}")
+    for end in (0, 1):
+        for angle in np.linspace(0, 2 * np.pi, CIRCLE_SEGMENTS, endpoint=False):
+            c = float(np.cos(angle) * radius)
+            s = float(np.sin(angle) * radius)
+            if axis == "x":
+                x = x0 if end == 0 else x1
+                lines.append(f"v {x:.6f} {cy + c:.6f} {z + s:.6f}")
+            else:
+                y = y0 if end == 0 else y1
+                lines.append(f"v {cx + c:.6f} {y:.6f} {z + s:.6f}")
+    first = list(range(vertex_index, vertex_index + CIRCLE_SEGMENTS))
+    second = list(range(vertex_index + CIRCLE_SEGMENTS, vertex_index + CIRCLE_SEGMENTS * 2))
+    lines.append("f " + " ".join(map(str, reversed(first))))
+    lines.append("f " + " ".join(map(str, second)))
+    for i in range(CIRCLE_SEGMENTS):
+        lines.append(f"f {first[i]} {first[(i + 1) % CIRCLE_SEGMENTS]} {second[(i + 1) % CIRCLE_SEGMENTS]} {second[i]}")
+    return vertex_index + CIRCLE_SEGMENTS * 2
+
+
+def write_obj_model(input_path: Path, groups: list[dict]) -> Path | None:
+    output = obj_path(input_path)
+    lines = ["# Modelo OBJ gerado a partir dos contornos detectados"]
+    vertex_index = 1
+    objects = 0
+    for group in groups:
+        if group.get("tipo") == "tubulacao":
+            vertex_index = append_pipe_cylinder(lines, group, vertex_index)
+            objects += 1
+            continue
+        contour = group.get("contorno", [])
+        if len(contour) < 3:
+            continue
+        lines.append(f"o grupo_{group['id']}_{group['tipo']}")
+        for x, y in contour:
+            lines.append(f"v {x:.6f} {y:.6f} {group['z_inicial']:.6f}")
+        for x, y in contour:
+            lines.append(f"v {x:.6f} {y:.6f} {group['z_final']:.6f}")
+        count = len(contour)
+        bottom = list(range(vertex_index, vertex_index + count))
+        top = list(range(vertex_index + count, vertex_index + count * 2))
+        lines.append("f " + " ".join(map(str, reversed(bottom))))
+        lines.append("f " + " ".join(map(str, top)))
+        for i in range(count):
+            lines.append(f"f {bottom[i]} {bottom[(i + 1) % count]} {top[(i + 1) % count]} {top[i]}")
+        vertex_index += count * 2
+        objects += 1
+    if objects == 0:
+        return None
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return output
 
 
 def parse_heights(args: argparse.Namespace, z_min: float, z_max: float) -> list[float]:
@@ -485,7 +668,10 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Pontos lidos por bloco")
     parser.add_argument("--batch-size", type=int, default=MAX_BATCH_SLICES, help="Fatias processadas por varredura")
     parser.add_argument("--sem-deteccao", action="store_true", help="Nao identifica formas com OpenCV")
+    parser.add_argument("--sem-obj", action="store_true", help="Nao gera modelo OBJ")
     parser.add_argument("--area-minima", type=float, default=DEFAULT_MIN_AREA, help="Area minima em pixels para detectar")
+    parser.add_argument("--tolerancia-modelo", type=float, default=DEFAULT_MODEL_TOLERANCE, help="Distancia maxima para agrupar fatias no OBJ")
+    parser.add_argument("--largura-maxima-tubulacao", type=float, default=DEFAULT_PIPE_MAX_WIDTH, help="Largura maxima real para linha fina virar tubulacao")
     args = parser.parse_args()
 
     if args.entrada is None:
@@ -547,6 +733,15 @@ def main() -> None:
         "z_absoluto": bool(args.z_absoluto),
         "fatias": records,
     }
+    obj_output = None
+    model_groups = []
+    if not args.sem_deteccao and not args.sem_obj:
+        model_groups = build_model_groups(records, max(0.001, args.tolerancia_modelo))
+        apply_pipe_detection(model_groups, max(0.001, args.largura_maxima_tubulacao), DEFAULT_PIPE_MIN_RATIO)
+        obj_output = write_obj_model(args.entrada, model_groups)
+        if obj_output is not None:
+            metadata["modelo_obj"] = str(obj_output)
+            metadata["grupos_modelagem"] = model_groups
     json_output = metadata_path(args.entrada)
     json_output.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     saved = [record for record in records if record["gerada"]]
@@ -559,6 +754,8 @@ def main() -> None:
             f"Imagem salva: {record['arquivo']} "
             f"({record['pontos']} pontos, z {record['z_inicial']:.4f}..{record['z_final']:.4f})"
         )
+    if obj_output is not None:
+        print(f"OBJ salvo: {obj_output}")
     print(f"JSON salvo: {json_output}")
 
 
