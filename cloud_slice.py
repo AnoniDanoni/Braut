@@ -19,6 +19,8 @@ DEFAULT_THICKNESS = 0.25
 MAX_PIXELS = 4096
 MAX_IMAGE_CELLS = 16_000_000
 MAX_BATCH_SLICES = 8
+DEFAULT_MIN_AREA = 20
+MAX_DETECTED_ELEMENTS = 500
 
 
 def log(message: str) -> None:
@@ -306,6 +308,8 @@ def build_plan_slices(
     max_x: float,
     min_y: float,
     max_y: float,
+    detect_shapes: bool,
+    min_area: float,
 ) -> tuple[list[dict], float | None, float | None]:
     images = [np.zeros((bins_y, bins_x), dtype=np.uint32) for _ in slices]
     counts = [0] * len(slices)
@@ -348,9 +352,101 @@ def build_plan_slices(
             log(f"Nenhum ponto entre z={z0:.4f} e z={z1:.4f}")
             records.append(record)
             continue
+        if detect_shapes:
+            record["elementos"] = detect_geometric_elements(image, min_area, min_x, max_x, min_y, max_y)
         plt.imsave(output, np.log1p(image), cmap="gray", origin="lower")
         records.append(record)
     return records, actual_min_z, actual_max_z
+
+
+def point_to_world(
+    x: float,
+    y: float,
+    bins_x: int,
+    bins_y: int,
+    min_x: float,
+    max_x: float,
+    min_y: float,
+    max_y: float,
+) -> tuple[float, float]:
+    world_x = min_x + (x / max(bins_x - 1, 1)) * (max_x - min_x)
+    world_y = min_y + (y / max(bins_y - 1, 1)) * (max_y - min_y)
+    return float(world_x), float(world_y)
+
+
+def classify_shape(vertices: int, area: float, perimeter: float, bbox: tuple[int, int, int, int]) -> str:
+    if vertices == 3:
+        return "triangulo"
+    if vertices == 4:
+        _, _, width, height = bbox
+        ratio = width / max(height, 1)
+        return "quadrado" if 0.9 <= ratio <= 1.1 else "retangulo"
+    circularity = 4 * np.pi * area / max(perimeter * perimeter, np.finfo(float).eps)
+    if circularity > 0.72:
+        return "circulo"
+    return "poligono"
+
+
+def detect_geometric_elements(
+    image: np.ndarray,
+    min_area: float,
+    min_x: float,
+    max_x: float,
+    min_y: float,
+    max_y: float,
+) -> list[dict]:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise SystemExit("Instale OpenCV com: pip install opencv-python") from exc
+
+    normalized = np.log1p(image)
+    if normalized.max() > 0:
+        normalized = (normalized / normalized.max() * 255).astype(np.uint8)
+    else:
+        normalized = normalized.astype(np.uint8)
+
+    blurred = cv2.GaussianBlur(normalized, (3, 3), 0)
+    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = np.ones((3, 3), np.uint8)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    bins_y, bins_x = image.shape
+    elements = []
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+        area = float(cv2.contourArea(contour))
+        if area < min_area:
+            continue
+        perimeter = float(cv2.arcLength(contour, True))
+        approx = cv2.approxPolyDP(contour, 0.02 * perimeter, True)
+        bbox = tuple(int(value) for value in cv2.boundingRect(approx))
+        moments = cv2.moments(contour)
+        if moments["m00"]:
+            cx = moments["m10"] / moments["m00"]
+            cy = moments["m01"] / moments["m00"]
+        else:
+            x, y, width, height = bbox
+            cx, cy = x + width / 2, y + height / 2
+        world_cx, world_cy = point_to_world(cx, cy, bins_x, bins_y, min_x, max_x, min_y, max_y)
+        x, y, width, height = bbox
+        world_x0, world_y0 = point_to_world(x, y, bins_x, bins_y, min_x, max_x, min_y, max_y)
+        world_x1, world_y1 = point_to_world(x + width, y + height, bins_x, bins_y, min_x, max_x, min_y, max_y)
+        elements.append(
+            {
+                "tipo": classify_shape(len(approx), area, perimeter, bbox),
+                "vertices": int(len(approx)),
+                "area_px": area,
+                "perimetro_px": perimeter,
+                "centro_px": [float(cx), float(cy)],
+                "centro": [world_cx, world_cy],
+                "bbox_px": [x, y, width, height],
+                "bbox": [world_x0, world_y0, world_x1, world_y1],
+            }
+        )
+        if len(elements) >= MAX_DETECTED_ELEMENTS:
+            break
+    return elements
 
 
 def parse_heights(args: argparse.Namespace, z_min: float, z_max: float) -> list[float]:
@@ -388,6 +484,8 @@ def main() -> None:
     parser.add_argument("--pixels", type=int, default=1600, help="Resolucao do maior lado da imagem")
     parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE, help="Pontos lidos por bloco")
     parser.add_argument("--batch-size", type=int, default=MAX_BATCH_SLICES, help="Fatias processadas por varredura")
+    parser.add_argument("--sem-deteccao", action="store_true", help="Nao identifica formas com OpenCV")
+    parser.add_argument("--area-minima", type=float, default=DEFAULT_MIN_AREA, help="Area minima em pixels para detectar")
     args = parser.parse_args()
 
     if args.entrada is None:
@@ -422,7 +520,17 @@ def main() -> None:
         batch = slices[start : start + args.batch_size]
         log(f"Processando fatias {start + 1}..{start + len(batch)} de {len(slices)}")
         batch_records, batch_min_z, batch_max_z = build_plan_slices(
-            args.entrada, args.chunk_size, batch, bins_x, bins_y, min_x, max_x, min_y, max_y
+            args.entrada,
+            args.chunk_size,
+            batch,
+            bins_x,
+            bins_y,
+            min_x,
+            max_x,
+            min_y,
+            max_y,
+            not args.sem_deteccao,
+            max(1, args.area_minima),
         )
         records.extend(batch_records)
         if batch_min_z is not None:
