@@ -18,7 +18,7 @@ DEFAULT_CHUNK_SIZE = 250_000
 DEFAULT_THICKNESS = 0.25
 MAX_PIXELS = 4096
 MAX_IMAGE_CELLS = 16_000_000
-MAX_BATCH_SLICES = 8
+MAX_BATCH_SLICES = 32
 DEFAULT_MIN_AREA = 20
 MAX_DETECTED_ELEMENTS = 500
 DEFAULT_MODEL_TOLERANCE = 0.35
@@ -306,6 +306,24 @@ def histogram_sizes(pixels: int, min_x: float, max_x: float, min_y: float, max_y
     return bins_x, bins_y
 
 
+def density_image(image: np.ndarray) -> np.ndarray:
+    if image.dtype == np.uint8:
+        return image
+    normalized = np.log1p(image)
+    if normalized.max() > 0:
+        return (normalized / normalized.max() * 255).astype(np.uint8)
+    return normalized.astype(np.uint8)
+
+
+def save_density_image(output: Path, image: np.ndarray) -> None:
+    try:
+        import cv2
+    except ImportError:
+        plt.imsave(output, np.flipud(density_image(image)), cmap="gray")
+        return
+    cv2.imwrite(str(output), np.flipud(density_image(image)))
+
+
 def build_plan_slices(
     path: Path,
     chunk_size: int,
@@ -319,27 +337,60 @@ def build_plan_slices(
     detect_shapes: bool,
     min_area: float,
 ) -> tuple[list[dict], float | None, float | None]:
-    images = [np.zeros((bins_y, bins_x), dtype=np.uint32) for _ in slices]
+    images = [np.zeros((bins_y, bins_x), dtype=np.uint8) for _ in slices]
     counts = [0] * len(slices)
     actual_min_z = None
     actual_max_z = None
     x_span = max(max_x - min_x, np.finfo(float).eps)
     y_span = max(max_y - min_y, np.finfo(float).eps)
+    z_starts = np.asarray([z0 for z0, _, _ in slices])
+    z_ends = np.asarray([z1 for _, z1, _ in slices])
+    batch_min_z = z_starts.min()
+    batch_max_z = z_ends.max()
+    slice_step = z_starts[1] - z_starts[0] if len(z_starts) > 1 else 0
+    regular_slices = len(z_starts) > 1 and slice_step >= (z_ends[0] - z_starts[0])
+    regular_slices = regular_slices and np.allclose(np.diff(z_starts), slice_step)
     for chunk in iter_points(path, chunk_size):
         if len(chunk) == 0:
             continue
-        chunk_min_z = chunk[:, 2].min()
-        chunk_max_z = chunk[:, 2].max()
+        zs = chunk[:, 2]
+        chunk_min_z = zs.min()
+        chunk_max_z = zs.max()
         actual_min_z = chunk_min_z if actual_min_z is None else min(actual_min_z, chunk_min_z)
         actual_max_z = chunk_max_z if actual_max_z is None else max(actual_max_z, chunk_max_z)
-        for index, (z0, z1, _) in enumerate(slices):
-            slice_points = chunk[(chunk[:, 2] >= z0) & (chunk[:, 2] <= z1)]
-            if len(slice_points) == 0:
+        if chunk_max_z < batch_min_z or chunk_min_z > batch_max_z:
+            continue
+        candidate_mask = (zs >= batch_min_z) & (zs <= batch_max_z)
+        if not candidate_mask.any():
+            continue
+        candidates = chunk[candidate_mask]
+        candidate_zs = zs[candidate_mask]
+        xs = np.minimum(((candidates[:, 0] - min_x) / x_span * bins_x).astype(np.int32), bins_x - 1)
+        ys = np.minimum(((candidates[:, 1] - min_y) / y_span * bins_y).astype(np.int32), bins_y - 1)
+        if regular_slices:
+            indexes = np.floor((candidate_zs - z_starts[0]) / slice_step).astype(np.int32)
+            valid = (indexes >= 0) & (indexes < len(slices))
+            valid[valid] &= candidate_zs[valid] <= z_ends[indexes[valid]]
+            if not valid.any():
                 continue
-            counts[index] += len(slice_points)
-            xs = np.minimum(((slice_points[:, 0] - min_x) / x_span * bins_x).astype(np.int32), bins_x - 1)
-            ys = np.minimum(((slice_points[:, 1] - min_y) / y_span * bins_y).astype(np.int32), bins_y - 1)
-            np.add.at(images[index], (ys, xs), 1)
+            intensity = np.zeros(len(candidate_zs), dtype=np.uint8)
+            valid_indexes = indexes[valid]
+            ratio = (candidate_zs[valid] - z_starts[valid_indexes]) / (z_ends[valid_indexes] - z_starts[valid_indexes])
+            intensity[valid] = np.clip(24 + ratio * 231, 24, 255).astype(np.uint8)
+            for index in np.unique(indexes[valid]):
+                slice_mask = valid & (indexes == index)
+                counts[index] += int(slice_mask.sum())
+                np.maximum.at(images[index], (ys[slice_mask], xs[slice_mask]), intensity[slice_mask])
+            continue
+        active_indexes = np.flatnonzero((z_starts <= chunk_max_z) & (z_ends >= chunk_min_z))
+        for index in active_indexes:
+            slice_mask = (candidate_zs >= z_starts[index]) & (candidate_zs <= z_ends[index])
+            if not slice_mask.any():
+                continue
+            counts[index] += int(slice_mask.sum())
+            ratio = (candidate_zs[slice_mask] - z_starts[index]) / (z_ends[index] - z_starts[index])
+            intensity = np.clip(24 + ratio * 231, 24, 255).astype(np.uint8)
+            np.maximum.at(images[index], (ys[slice_mask], xs[slice_mask]), intensity)
 
     records = []
     for image, count, (z0, z1, output) in zip(images, counts, slices):
@@ -362,7 +413,7 @@ def build_plan_slices(
             continue
         if detect_shapes:
             record["elementos"] = detect_geometric_elements(image, min_area, min_x, max_x, min_y, max_y)
-        plt.imsave(output, np.log1p(image), cmap="gray", origin="lower")
+        save_density_image(output, image)
         records.append(record)
     return records, actual_min_z, actual_max_z
 
@@ -408,11 +459,7 @@ def detect_geometric_elements(
     except ImportError as exc:
         raise SystemExit("Instale OpenCV com: pip install opencv-python") from exc
 
-    normalized = np.log1p(image)
-    if normalized.max() > 0:
-        normalized = (normalized / normalized.max() * 255).astype(np.uint8)
-    else:
-        normalized = normalized.astype(np.uint8)
+    normalized = density_image(image)
 
     blurred = cv2.GaussianBlur(normalized, (3, 3), 0)
     _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
