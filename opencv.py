@@ -14,6 +14,7 @@ SAIDA_JSON_3D = Path(__file__).with_name("modelo_3d.json")
 EXTENSOES_IMAGEM = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 MIN_FATIAS_3D = 3
 MIN_FATIAS_LINHA = 5
+MIN_CONFIANCA_TUBULACAO = 0.7
 
 
 def eh_linha(cnt, w, h):
@@ -69,15 +70,24 @@ def preparar_imagem(caminho_imagem):
     return gray, mask
 
 
-def tem_degrade(gray, cnt):
+def tem_degrade(gray, cnt, sensivel=False):
     mascara = np.zeros(gray.shape, dtype=np.uint8)
     cv2.drawContours(mascara, [cnt], -1, 255, -1)
-    pixels = gray[mascara == 255]
+    ys, xs = np.where(mascara == 255)
+    pixels = gray[ys, xs]
     if pixels.size < 30:
         return False
 
-    p10, p90 = np.percentile(pixels, [10, 90])
-    return pixels.std() >= 18 and p90 - p10 >= 35
+    regioes = [pixels]
+    if sensivel:
+        cx, cy = np.median(xs), np.median(ys)
+        regioes += [pixels[xs <= cx], pixels[xs > cx], pixels[ys <= cy], pixels[ys > cy]]
+    limite_desvio, limite_amplitude = (16, 30) if sensivel else (14, 28)
+    return any(
+        regiao.size >= 20 and regiao.std() >= limite_desvio
+        and np.ptp(np.percentile(regiao, [10, 90])) >= limite_amplitude
+        for regiao in regioes
+    )
 
 
 def classificar_forma(cnt, gray, forma_forcada=None):
@@ -99,7 +109,7 @@ def classificar_forma(cnt, gray, forma_forcada=None):
     circularidade = 4 * math.pi * area / (peri * peri) if peri else 0
     aspect_ratio = w / float(h)
     fechada = "FECHADA" if preenchimento > 0.35 else "ABERTA"
-    degrade = tem_degrade(gray, cnt)
+    degrade = tem_degrade(gray, cnt, forma_forcada == "CIRCULO")
 
     if forma_forcada:
         forma = forma_forcada
@@ -147,30 +157,48 @@ def detectar_circulos(gray):
     escala = min(1.0, 1200 / max(gray.shape))
     reduzida = cv2.resize(gray, None, fx=escala, fy=escala, interpolation=cv2.INTER_AREA)
     suavizada = cv2.GaussianBlur(reduzida, (7, 7), 1.5)
-    bordas = cv2.Canny(suavizada, 50, 120)
+    bordas = cv2.Canny(suavizada, 45, 110)
     distancia_borda = cv2.distanceTransform(255 - bordas, cv2.DIST_L2, 3)
     circulos = cv2.HoughCircles(
         suavizada, cv2.HOUGH_GRADIENT, 1.2, max(20, int(45 * escala)),
-        param1=100, param2=58, minRadius=max(6, int(15 * escala)),
+        param1=100, param2=55, minRadius=max(6, int(15 * escala)),
         maxRadius=max(20, int(min(gray.shape) * 0.18 * escala)),
     )
+    parciais = cv2.HoughCircles(
+        suavizada, cv2.HOUGH_GRADIENT, 1.2, max(20, int(45 * escala)),
+        param1=100, param2=35, minRadius=max(6, int(15 * escala)),
+        maxRadius=max(20, int(min(gray.shape) * 0.22 * escala)),
+    )
+    candidatos = [(*circulo, False) for circulo in circulos[0]] if circulos is not None else []
+    candidatos += [(*circulo, True) for circulo in parciais[0]] if parciais is not None else []
     formas = []
-    for x, y, raio in circulos[0] if circulos is not None else []:
+    for x, y, raio, parcial in candidatos:
         angulos = np.linspace(0, 2 * np.pi, 180, endpoint=False)
         xs = np.clip((x + np.cos(angulos) * raio).astype(int), 0, reduzida.shape[1] - 1)
         ys = np.clip((y + np.sin(angulos) * raio).astype(int), 0, reduzida.shape[0] - 1)
-        if np.mean(distancia_borda[ys, xs] <= 2) < 0.55:
+        apoios = (distancia_borda[ys, xs] <= 2).astype(float)
+        suporte = float(apoios.mean())
+        suporte_metade = float(np.convolve(np.r_[apoios, apoios[:89]], np.ones(90) / 90, mode="valid").max())
+        if (parcial and (suporte > 0.55 or suporte_metade < 0.85)) or (
+            not parcial and suporte < 0.50 and suporte_metade < 0.80
+        ):
             continue
         x, y, raio = x / escala, y / escala, raio / escala
+        if any(math.hypot(x - item[0], y - item[1]) < min(raio, item[2]) * 0.3
+               and max(raio, item[2]) / min(raio, item[2]) < 1.25 for item in formas):
+            continue
         contorno = np.asarray([
             [[round(x + math.cos(angulo) * raio), round(y + math.sin(angulo) * raio)]]
             for angulo in np.linspace(0, 2 * np.pi, 64, endpoint=False)
         ], dtype=np.int32)
         dados = classificar_forma(contorno, gray, "CIRCULO")
+        if parcial and not dados["degrade"]:
+            continue
         if dados["degrade"]:
             dados["forma"] = "MEIA_ESFERA"
-        formas.append(dados)
-    return formas
+        dados["confianca_deteccao"] = round(max(suporte, suporte_metade * 0.75), 3)
+        formas.append((x, y, raio, dados))
+    return [item[3] for item in formas]
 
 
 def detectar_retangulos(gray):
@@ -187,7 +215,8 @@ def detectar_retangulos(gray):
         if len(aproximado) != 4 or not cv2.isContourConvex(aproximado):
             continue
         x, y, largura, altura = cv2.boundingRect(aproximado)
-        if area / (largura * altura) < 0.78 or min(largura, altura) < 30:
+        retangularidade = area / (largura * altura)
+        if retangularidade < 0.78 or min(largura, altura) < 30:
             continue
         bbox = np.asarray([x, y, x + largura, y + altura])
         escala = np.asarray([largura, altura, largura, altura])
@@ -199,6 +228,7 @@ def detectar_retangulos(gray):
         if dados["degrade"]:
             dados["forma"] = "RAMPA"
             dados["angulo_rampa_graus"] = gradiente if gradiente is not None else (0.0 if largura >= altura else 90.0)
+        dados["confianca_deteccao"] = round(float(min(1, retangularidade)), 3)
         candidatos.append((bbox, dados))
     return [forma for _, forma in candidatos]
 
@@ -250,6 +280,7 @@ def detectar_linhas(gray):
         ], dtype=np.int32).reshape(-1, 1, 2)
         dados = classificar_forma(contorno, gray, "LINHA")
         dados["linha_px"] = {"start": [x1, y1], "end": [x2, y2]}
+        dados["confianca_deteccao"] = round(float(min(1, comprimento / (min(gray.shape) * 0.3))), 3)
         candidatas.append((angulo, rho, comprimento, dados))
     return [item[3] for item in sorted(candidatas, key=lambda item: item[2], reverse=True)[:40]]
 
@@ -342,7 +373,8 @@ def agrupar_formas(fatias):
                 ultimo_tamanho = max(ultimo["coordenada"]["largura"], ultimo["coordenada"]["altura"])
                 distancia = math.hypot(centro["x"] - ultimo_centro["x"], centro["y"] - ultimo_centro["y"])
                 proporcao = max(tamanho, ultimo_tamanho) / max(1, min(tamanho, ultimo_tamanho))
-                limite_distancia = max(12, ultimo_tamanho * (0.15 if familia == "LINEAR" else 0.6))
+                fator_distancia = {"LINEAR": 0.12, "REDONDA": 0.25, "RETANGULAR": 0.2}[familia]
+                limite_distancia = max(10, ultimo_tamanho * fator_distancia)
                 if familia == "LINEAR":
                     atual = forma["linha_px"]
                     anterior = ultimo["linha_px"]
@@ -350,7 +382,8 @@ def agrupar_formas(fatias):
                     angulo_anterior = math.atan2(anterior["end"][1] - anterior["start"][1], anterior["end"][0] - anterior["start"][0]) % math.pi
                     if min(abs(angulo_atual - angulo_anterior), math.pi - abs(angulo_atual - angulo_anterior)) > math.radians(8):
                         continue
-                if 1 <= intervalo <= 2 and distancia <= limite_distancia and proporcao <= (1.6 if familia == "LINEAR" else 2.5):
+                limite_proporcao = 1.6 if familia == "REDONDA" else 1.5
+                if 1 <= intervalo <= 2 and distancia <= limite_distancia and proporcao <= limite_proporcao:
                     candidatos.append((distancia / max(ultimo_tamanho, 1) + intervalo * 0.1, grupo))
             if candidatos:
                 grupo = min(candidatos, key=lambda item: item[0])[1]
@@ -405,19 +438,60 @@ def tipo_geometria(formas):
 
 
 def tipo_geometria_grupo(grupo, formas):
+    def converter_para_circulo(indices):
+        for indice in indices:
+            forma = grupo["ocorrencias"][indice][1]
+            forma["forma_final"] = "CIRCULO"
+            forma["ajuste_estrutural"] = "Degrade descartado: semiesfera so e valida no topo de um cilindro."
+            formas[indice] = "CIRCULO"
+
     tipos = set(formas)
+    if tipos == {"LINHA"}:
+        return "TUBULACAO" if len(formas) < MIN_FATIAS_LINHA else "GEOMETRIA_LINEAR"
     if tipos == {"MEIA_ESFERA"}:
-        return "MEIA_ESFERA"
+        raios = np.asarray([
+            (forma["coordenada"]["largura"] + forma["coordenada"]["altura"]) / 4
+            for _, forma in grupo["ocorrencias"]
+        ])
+        correlacao = np.corrcoef(np.arange(len(raios)), raios)[0, 1] if len(raios) >= 3 else 0
+        valida = len(raios) >= 3 and raios[-1] < raios[0] * 0.8 and correlacao < -0.8
+        if not valida:
+            converter_para_circulo(range(len(formas)))
+        return "MEIA_ESFERA" if valida else "CILINDRO"
     if tipos == {"CIRCULO", "MEIA_ESFERA"}:
         circulos = [i for i, forma in enumerate(formas) if forma == "CIRCULO"]
         semiesferas = [i for i, forma in enumerate(formas) if forma == "MEIA_ESFERA"]
-        inferior = [i for i in semiesferas if i < min(circulos)]
         superior = [i for i in semiesferas if i > max(circulos)]
-        if len(inferior) + len(superior) == len(semiesferas):
-            return "TANQUE_COM_DUAS_SEMIESFERAS" if inferior and superior else "TANQUE_COM_UMA_SEMIESFERA"
-        return "CILINDRO"
-    if "RAMPA" in formas:
-        return "RAMPA"
+        raio_cilindro = np.median([
+            (grupo["ocorrencias"][i][1]["coordenada"]["largura"] + grupo["ocorrencias"][i][1]["coordenada"]["altura"]) / 4
+            for i in circulos
+        ])
+        raios_superiores = [
+            (grupo["ocorrencias"][i][1]["coordenada"]["largura"] + grupo["ocorrencias"][i][1]["coordenada"]["altura"]) / 4
+            for i in superior
+        ]
+        cap_valido = (
+            len(raios_superiores) >= 2
+            and raios_superiores[-1] <= raio_cilindro * 0.85
+            and np.mean(np.diff(raios_superiores) <= raio_cilindro * 0.05) >= 0.7
+        ) or (len(raios_superiores) == 1 and raios_superiores[0] <= raio_cilindro * 0.7)
+        converter_para_circulo([i for i in semiesferas if not cap_valido or i not in superior])
+        return "TANQUE_COM_SEMIESFERA_SUPERIOR" if cap_valido else "CILINDRO"
+    if "RAMPA" in formas and any(forma in {"QUADRADO", "RETANGULO"} for forma in formas):
+        rampas = [i for i, forma in enumerate(formas) if forma == "RAMPA"]
+        paredes = [i for i, forma in enumerate(formas) if forma in {"QUADRADO", "RETANGULO"}]
+        superiores = [i for i in rampas if i > max(paredes)]
+        forma_base = Counter(formas[i] for i in paredes).most_common(1)[0][0]
+        for indice in rampas:
+            if indice in superiores:
+                continue
+            forma = grupo["ocorrencias"][indice][1]
+            forma["forma_final"] = forma_base
+            forma["ajuste_estrutural"] = "Rampa descartada: cobertura inclinada so e valida acima das paredes."
+            formas[indice] = forma_base
+        return "PRISMA_COM_TELHADO_DUAS_AGUAS" if superiores else "PRISMA_RETANGULAR"
+    if tipos == {"RAMPA"}:
+        return "TELHADO_DUAS_AGUAS"
     return tipo_geometria(formas)
 
 
@@ -434,12 +508,13 @@ def resumir_sequencia(formas):
 def regra_aplicada(tipo):
     regras = {
         "CILINDRO": "Duas ou mais fatias circulares consecutivas representam um cilindro.",
-        "TANQUE_COM_UMA_SEMIESFERA": "Um cilindro com semiesfera em uma extremidade representa um tanque.",
-        "TANQUE_COM_DUAS_SEMIESFERAS": "Um cilindro entre duas semiesferas representa um tanque.",
+        "TANQUE_COM_SEMIESFERA_SUPERIOR": "Um cilindro com semiesfera somente na extremidade superior representa um tanque.",
         "MEIA_ESFERA": "Um circulo com degrade representa uma semiesfera.",
-        "RAMPA": "Um gradiente linear persistente representa uma rampa inclinada.",
+        "TELHADO_DUAS_AGUAS": "Duas rampas simetricas conectadas por uma cumeeira representam um telhado.",
+        "PRISMA_COM_TELHADO_DUAS_AGUAS": "Um prisma retangular com duas rampas superiores representa uma edificacao com telhado.",
         "PRISMA_RETANGULAR": "Quadrados ou retangulos repetidos em fatias consecutivas representam um prisma retangular.",
         "PRISMA_TRIANGULAR": "Triangulos repetidos em fatias consecutivas representam um prisma triangular.",
+        "TUBULACAO": "Uma linha que desaparece entre as fatias representa uma tubulacao.",
         "GEOMETRIA_COMPOSTA": "A mudanca de forma ao longo das fatias representa uma geometria composta.",
     }
     return regras.get(tipo, f"A forma predominante e a continuidade das fatias resultaram em {tipo}.")
@@ -483,11 +558,34 @@ def coordenadas_grupo(grupo, fatias):
     }
 
 
+def confianca_grupo(grupo):
+    ocorrencias = grupo["ocorrencias"]
+    indices = [indice for indice, _ in ocorrencias]
+    cobertura = len(indices) / (max(indices) - min(indices) + 1)
+    centros = np.asarray([
+        [forma["coordenada"]["centro_medio_px"]["x"], forma["coordenada"]["centro_medio_px"]["y"]]
+        for _, forma in ocorrencias
+    ])
+    tamanhos = np.asarray([
+        max(forma["coordenada"]["largura"], forma["coordenada"]["altura"])
+        for _, forma in ocorrencias
+    ])
+    dispersao = np.mean(np.linalg.norm(centros - np.median(centros, axis=0), axis=1)) / max(tamanhos.mean(), 1)
+    deteccao = np.mean([forma.get("confianca_deteccao", 0.7) for _, forma in ocorrencias])
+    confianca = deteccao * (0.6 + 0.4 * cobertura) * max(0, 1 - dispersao * 2)
+    return round(float(confianca), 3), round(float(cobertura), 3)
+
+
 def montar_geometrias(fatias):
     geometrias = []
     for grupo in agrupar_formas(fatias):
-        minimo = MIN_FATIAS_LINHA if grupo["ocorrencias"][0][1]["forma"] == "LINHA" else MIN_FATIAS_3D
+        eh_linha = grupo["ocorrencias"][0][1]["forma"] == "LINHA"
+        minimo = 1 if eh_linha else MIN_FATIAS_3D
         if len(grupo["ocorrencias"]) < minimo:
+            continue
+        if eh_linha and len(grupo["ocorrencias"]) < MIN_FATIAS_LINHA and np.mean([
+            forma.get("confianca_deteccao", 0) for _, forma in grupo["ocorrencias"]
+        ]) < MIN_CONFIANCA_TUBULACAO:
             continue
         corrigir_indefinidas(grupo)
         formas = [forma["forma_final"] for _, forma in grupo["ocorrencias"] if forma["forma_final"] != "INDEFINIDA"]
@@ -497,17 +595,17 @@ def montar_geometrias(fatias):
         inferidas = sum(forma["forma_inferida"] is not None for _, forma in grupo["ocorrencias"])
         indices = [indice + 1 for indice, _ in grupo["ocorrencias"]]
         sequencia = resumir_sequencia(formas)
-        confianca = (len(formas) - inferidas * 0.25) / len(grupo["ocorrencias"])
+        confianca, cobertura = confianca_grupo(grupo)
         geometrias.append({
-            "id": grupo["id"],
+            "id": len(geometrias) + 1,
             "geometria": tipo,
             "descricao": (
                 f"{tipo.replace('_', ' ').title()} inferido pela continuidade de {len(formas)} fatias "
                 f"entre as imagens {min(indices)} e {max(indices)}; {inferidas} classificacao(oes) indefinida(s) foi(ram) corrigida(s)."
             ),
-            "confianca": round(float(confianca), 3),
+            "confianca": confianca,
             "condicoes_avaliadas": [
-                {"condicao": "continuidade espacial", "resultado": True, "evidencia": f"Objeto acompanhado nas fatias {indices}."},
+                {"condicao": "continuidade espacial", "resultado": cobertura >= 0.6, "evidencia": f"Cobertura de {cobertura:.1%} entre as fatias {min(indices)} e {max(indices)}."},
                 {"condicao": "formas indefinidas entre vizinhas", "resultado": inferidas > 0, "evidencia": f"{inferidas} forma(s) corrigida(s)."},
                 {"condicao": "sequencia de formas", "resultado": True, "evidencia": sequencia},
                 {"condicao": "regra geometrica", "resultado": tipo, "evidencia": regra_aplicada(tipo)},
@@ -516,6 +614,13 @@ def montar_geometrias(fatias):
             "coordenadas": coordenadas_grupo(grupo, fatias),
         })
     return geometrias
+
+
+def salvar_json(caminho, dados):
+    caminho = Path(caminho)
+    temporario = caminho.with_suffix(caminho.suffix + ".tmp")
+    temporario.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporario.replace(caminho)
 
 
 def gerar_json_3d(resultado, caminho_json=SAIDA_JSON_3D):
@@ -563,22 +668,56 @@ def gerar_json_3d(resultado, caminho_json=SAIDA_JSON_3D):
         z_inicial, z_final = intervalo_z(valores)
         return {"start": [x, y, z_inicial], "end": [x, y, z_final], "radius": float((largura + altura) / 4)}
 
+    def semiesfera(valores, normal):
+        raios = [float(sum(dimensoes([item])) / 4) for item in valores]
+        maior = int(np.argmax(raios))
+        x, y, z = centro([valores[maior]])
+        return {"center": [x, y, z], "radius": raios[maior], "normal": normal}
+
+    def telhado_duas_aguas(valores, z_base=None):
+        x, y, _ = centro(valores)
+        largura, altura = dimensoes(valores)
+        z_inicial, z_final = intervalo_z(valores)
+        base = float(z_base if z_base is not None else z_inicial)
+        menor, maior = float(min(largura, altura)), float(max(largura, altura))
+        topo = max(float(z_final), base + menor * math.tan(math.radians(30)) / 2)
+        if largura >= altura:
+            inicios = ([x, y - altura / 2, base], [x, y + altura / 2, base])
+        else:
+            inicios = ([x - largura / 2, y, base], [x + largura / 2, y, base])
+        fim = [x, y, topo]
+        return [{"start": inicio, "end": fim, "width": maior} for inicio in inicios]
+
     for geometria in resultado["geometrias"]:
         tipo = geometria["geometria"]
         valores = amostras(geometria)
         x, y, z = centro(valores)
         largura, altura = dimensoes(valores)
         raio = float((largura + altura) / 4)
-        if tipo == "GEOMETRIA_LINEAR":
+        if tipo in {"GEOMETRIA_LINEAR", "TUBULACAO"}:
             inicios, finais = [], []
             for item in valores:
                 inicio, fim = item["linha"]["start"], item["linha"]["end"]
                 inicios.append(inicio if len(inicio) == 3 else [*inicio, item["fatia"]])
                 finais.append(fim if len(fim) == 3 else [*fim, item["fatia"]])
-            adicionar("line", {
-                "start": [float(valor) for valor in np.mean(inicios, axis=0)],
-                "end": [float(valor) for valor in np.mean(finais, axis=0)],
-            })
+            inicio = np.mean(inicios, axis=0)
+            fim = np.mean(finais, axis=0)
+            z_inicial, z_final = intervalo_z(valores)
+            if tipo == "TUBULACAO":
+                z = (z_inicial + z_final) / 2
+                adicionar("cylinder", {
+                    "start": [float(inicio[0]), float(inicio[1]), z],
+                    "end": [float(fim[0]), float(fim[1]), z],
+                    "radius": max((z_final - z_inicial) / 2, 0.01),
+                })
+                continue
+            base_inicio, base_fim = [float(inicio[0]), float(inicio[1]), z_inicial], [float(fim[0]), float(fim[1]), z_inicial]
+            topo_inicio, topo_fim = [float(inicio[0]), float(inicio[1]), z_final], [float(fim[0]), float(fim[1]), z_final]
+            for linha in (
+                {"start": base_inicio, "end": base_fim}, {"start": topo_inicio, "end": topo_fim},
+                {"start": base_inicio, "end": topo_inicio}, {"start": base_fim, "end": topo_fim},
+            ):
+                adicionar("line", linha)
         elif tipo == "QUADRADO":
             adicionar("square", {"center": [x, y, z], "size": float((largura + altura) / 2), "rotation": [0, 0, 0]})
         elif tipo == "RETANGULO":
@@ -587,43 +726,40 @@ def gerar_json_3d(resultado, caminho_json=SAIDA_JSON_3D):
             adicionar("circle", {"center": [x, y, z], "radius": raio, "normal": [0, 0, 1]})
         elif tipo == "MEIA_ESFERA":
             raios = [float(sum(dimensoes([item])) / 4) for item in valores]
-            maior = int(np.argmax(raios))
-            hx, hy, hz = centro([valores[maior]])
             normal = [0, 0, -1 if raios[-1] > raios[0] else 1]
-            adicionar("hemisphere", {"center": [hx, hy, hz], "radius": raios[maior], "normal": normal})
-        elif tipo == "RAMPA":
-            z_inicial, z_final = intervalo_z(valores)
-            angulos = [item["angulo_rampa_graus"] for item in valores if "angulo_rampa_graus" in item]
-            angulo = math.radians(float(np.mean(angulos)))
-            comprimento = float(max(largura, altura))
-            dx, dy = math.cos(angulo) * comprimento / 2, math.sin(angulo) * comprimento / 2
-            adicionar("ramp", {
-                "start": [x - dx, y - dy, z_inicial],
-                "end": [x + dx, y + dy, z_final],
-                "width": float(min(largura, altura)),
-            })
+            adicionar("hemisphere", semiesfera(valores, normal))
+        elif tipo == "TELHADO_DUAS_AGUAS":
+            for rampa in telhado_duas_aguas(valores):
+                adicionar("ramp", rampa)
+        elif tipo == "PRISMA_COM_TELHADO_DUAS_AGUAS":
+            paredes = amostras(geometria, {"QUADRADO", "RETANGULO"})
+            cobertura = amostras(geometria, {"RAMPA"})
+            px, py, _ = centro(paredes)
+            pl, pa = dimensoes(paredes)
+            z_inicial, z_final = intervalo_z(paredes)
+            adicionar("box", {"center": [px, py, (z_inicial + z_final) / 2], "size": [float(pl), float(pa), z_final - z_inicial], "rotation": [0, 0, 0]})
+            for rampa in telhado_duas_aguas(paredes[-3:] + cobertura, z_final):
+                adicionar("ramp", rampa)
         elif tipo == "PRISMA_RETANGULAR":
             z_inicial, z_final = intervalo_z(valores)
             adicionar("box", {"center": [x, y, (z_inicial + z_final) / 2], "size": [float(largura), float(altura), z_final - z_inicial], "rotation": [0, 0, 0]})
         elif tipo == "CILINDRO":
             adicionar("cylinder", cilindro(valores))
-        elif tipo in {"TANQUE_COM_UMA_SEMIESFERA", "TANQUE_COM_DUAS_SEMIESFERAS"}:
+        elif tipo == "TANQUE_COM_SEMIESFERA_SUPERIOR":
             circulos = amostras(geometria, {"CIRCULO"})
             semiesferas = amostras(geometria, {"MEIA_ESFERA"})
-            adicionar("cylinder", cilindro(circulos))
-            menor_circulo, maior_circulo = min(item["fatia"] for item in circulos), max(item["fatia"] for item in circulos)
-            for ponta in ([item for item in semiesferas if item["fatia"] < menor_circulo], [item for item in semiesferas if item["fatia"] > maior_circulo]):
-                if ponta:
-                    px, py, pz = centro(ponta)
-                    pl, pa = dimensoes(ponta)
-                    normal = [0, 0, -1] if ponta[0]["fatia"] < menor_circulo else [0, 0, 1]
-                    adicionar("hemisphere", {"center": [px, py, pz], "radius": float((pl + pa) / 4), "normal": normal})
+            corpo = cilindro(circulos)
+            adicionar("cylinder", corpo)
+            maior_circulo = max(item["fatia"] for item in circulos)
+            superior = [item for item in semiesferas if item["fatia"] > maior_circulo]
+            if superior:
+                adicionar("hemisphere", {"center": corpo["end"], "radius": corpo["radius"], "normal": [0, 0, 1]})
 
-    Path(caminho_json).write_text(json.dumps(objetos, ensure_ascii=False, indent=2), encoding="utf-8")
+    salvar_json(caminho_json, objetos)
     return objetos
 
 
-def analisar_imagens(caminhos_imagens, caminho_json=SAIDA_JSON, metadados=None):
+def analisar_imagens(caminhos_imagens, caminho_json=SAIDA_JSON, metadados=None, caminho_json_3d=None):
     metadados = metadados or {}
     caminhos_imagens = sorted(caminhos_imagens, key=lambda caminho: (
         metadados.get(Path(caminho).name.lower(), {}).get("z_inicial", float("inf")), chave_natural(caminho)
@@ -636,15 +772,19 @@ def analisar_imagens(caminhos_imagens, caminho_json=SAIDA_JSON, metadados=None):
         "analise": {
             "total_fatias": len(fatias),
             "total_geometrias": len(geometrias),
-            "criterio": f"Geometrias consistentes precisam aparecer em pelo menos {MIN_FATIAS_3D} fatias; linhas precisam ser longas e persistir por pelo menos {MIN_FATIAS_LINHA} fatias.",
+            "criterio": f"Geometrias consistentes precisam aparecer em pelo menos {MIN_FATIAS_3D} fatias; linhas transitorias com confianca minima de {MIN_CONFIANCA_TUBULACAO:.0%} representam tubulacoes.",
+            "regras_engenharia": {
+                "tanque": "Semiesfera somente no topo, conectada ao cilindro com mesmo centro e raio.",
+                "telhado": "Duas rampas simetricas conectadas pela mesma cumeeira e apoiadas sobre o prisma.",
+                "linhas": "Linhas transitorias representam tubulacoes; segmentos persistentes permanecem independentes.",
+            },
         },
         "fatias": fatias,
         "geometrias": geometrias,
     }
 
-    with open(caminho_json, "w", encoding="utf-8") as arquivo:
-        json.dump(resultado, arquivo, ensure_ascii=False, indent=2)
-    gerar_json_3d(resultado)
+    salvar_json(caminho_json, resultado)
+    gerar_json_3d(resultado, caminho_json_3d or Path(caminho_json).with_name(SAIDA_JSON_3D.name))
 
     return resultado
 
